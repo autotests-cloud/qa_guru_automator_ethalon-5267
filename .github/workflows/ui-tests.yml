@@ -23,6 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ALLURE_PROJECT_ID: ${{ vars.ALLURE_PROJECT_ID }}
+      ALLURE_ENDPOINT: ${{ vars.ALLURE_ENDPOINT || 'https://allure.autotests.cloud' }}
+      ALLURE_RESULTS: build/allure-results
+      ALLURE_UPLOAD: ${{ vars.ALLURE_PROJECT_ID != '' && secrets.ALLURE_TOKEN != '' }}
       BROWSER_VERSION: "148"
       REPORT_ID: ${{ github.run_id }}
       TEST_CASE_ID: ${{ github.event.inputs.test_case_id || '' }}
@@ -58,13 +61,28 @@ jobs:
             cp gh-pages/history.jsonl history.jsonl
           fi
 
+      - name: Install allurectl
+        if: env.ALLURE_UPLOAD == 'true'
+        uses: allure-framework/setup-allurectl@v1
+        with:
+          allure-endpoint: ${{ env.ALLURE_ENDPOINT }}
+          allure-token: ${{ secrets.ALLURE_TOKEN }}
+          allure-project-id: ${{ vars.ALLURE_PROJECT_ID }}
+
       - name: Run UI tests on Selenoid
         run: |
           set +e
           if [ -n "$TEST_CASE_ID" ]; then
-            ./gradlew test --tests "tests.TestCase${TEST_CASE_ID}Tests" -Denv=ci -DbrowserVersion=${BROWSER_VERSION}
+            TEST_CMD=(./gradlew test --tests "tests.TestCase${TEST_CASE_ID}Tests" -Denv=ci -DbrowserVersion="${BROWSER_VERSION}")
+            export ALLURE_LAUNCH_NAME="TestCase${TEST_CASE_ID} — ${GITHUB_REPOSITORY} #${GITHUB_RUN_NUMBER}"
           else
-            ./gradlew test -Denv=ci -DbrowserVersion=${BROWSER_VERSION}
+            TEST_CMD=(./gradlew test -Denv=ci -DbrowserVersion="${BROWSER_VERSION}")
+            export ALLURE_LAUNCH_NAME="UI Tests — ${GITHUB_REPOSITORY} #${GITHUB_RUN_NUMBER}"
+          fi
+          if [ "$ALLURE_UPLOAD" = "true" ]; then
+            allurectl watch -- "${TEST_CMD[@]}"
+          else
+            "${TEST_CMD[@]}"
           fi
           echo "TEST_EXIT=$?" >> "$GITHUB_ENV"
           set -e
