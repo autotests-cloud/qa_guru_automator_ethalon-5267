@@ -15,17 +15,15 @@ concurrency:
 
 permissions:
   contents: write
-  pages: write
 
 jobs:
   ui-tests:
     name: UI Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
-      ALLURE_PROJECT_ID: ${{ vars.ALLURE_PROJECT_ID }}
       ALLURE_ENDPOINT: ${{ vars.ALLURE_ENDPOINT || 'https://allure.autotests.cloud' }}
       ALLURE_RESULTS: build/allure-results
-      ALLURE_UPLOAD: ${{ vars.ALLURE_PROJECT_ID != '' && secrets.ALLURE_TOKEN != '' }}
       BROWSER_VERSION: "148"
       REPORT_ID: ${{ github.run_id }}
       TEST_CASE_ID: ${{ github.event.inputs.test_case_id || '' }}
@@ -62,7 +60,9 @@ jobs:
           fi
 
       - name: Install allurectl
-        if: env.ALLURE_UPLOAD == 'true'
+        if: vars.ALLURE_PROJECT_ID != '' && secrets.ALLURE_TOKEN != ''
+        continue-on-error: true
+        id: setup-allurectl
         uses: allure-framework/setup-allurectl@v1
         with:
           allure-endpoint: ${{ env.ALLURE_ENDPOINT }}
@@ -73,18 +73,40 @@ jobs:
         run: |
           set +e
           if [ -n "$TEST_CASE_ID" ]; then
-            TEST_CMD=(./gradlew test --tests "tests.TestCase${TEST_CASE_ID}Tests" -Denv=ci -DbrowserVersion="${BROWSER_VERSION}")
-            export ALLURE_LAUNCH_NAME="TestCase${TEST_CASE_ID} — ${GITHUB_REPOSITORY} #${GITHUB_RUN_NUMBER}"
+            ./gradlew test --tests "tests.TestCase${TEST_CASE_ID}Tests" -Denv=ci -DbrowserVersion="${BROWSER_VERSION}"
           else
-            TEST_CMD=(./gradlew test -Denv=ci -DbrowserVersion="${BROWSER_VERSION}")
-            export ALLURE_LAUNCH_NAME="UI Tests — ${GITHUB_REPOSITORY} #${GITHUB_RUN_NUMBER}"
-          fi
-          if [ "$ALLURE_UPLOAD" = "true" ]; then
-            allurectl watch -- "${TEST_CMD[@]}"
-          else
-            "${TEST_CMD[@]}"
+            ./gradlew test -Denv=ci -DbrowserVersion="${BROWSER_VERSION}"
           fi
           echo "TEST_EXIT=$?" >> "$GITHUB_ENV"
+          set -e
+
+      - name: Upload results to Allure TestOps
+        if: always() && steps.setup-allurectl.outcome == 'success' && hashFiles('build/allure-results/**') != ''
+        continue-on-error: true
+        id: testops-upload
+        env:
+          ALLURE_PROJECT_ID: ${{ vars.ALLURE_PROJECT_ID }}
+        run: |
+          set +e
+          if [ -n "$TEST_CASE_ID" ]; then
+            export ALLURE_LAUNCH_NAME="TestCase${TEST_CASE_ID} — ${GITHUB_REPOSITORY} #${GITHUB_RUN_NUMBER}"
+          else
+            export ALLURE_LAUNCH_NAME="UI Tests — ${GITHUB_REPOSITORY} #${GITHUB_RUN_NUMBER}"
+          fi
+          allurectl upload build/allure-results 2>&1 | tee allurectl-upload.log
+          UPLOAD_EXIT=${PIPESTATUS[0]}
+          echo "TESTOPS_UPLOAD_EXIT=${UPLOAD_EXIT}" >> "$GITHUB_ENV"
+          if [ "$UPLOAD_EXIT" -eq 0 ]; then
+            LAUNCH_URL=$(grep -Eo 'https://[^ ]+/launch/[0-9]+' allurectl-upload.log | head -1 || true)
+            if [ -z "$LAUNCH_URL" ] && allurectl job-run env >/tmp/allure-env 2>/dev/null; then
+              # shellcheck disable=SC1091
+              source /tmp/allure-env
+              LAUNCH_URL="${ALLURE_LAUNCH_URL:-}"
+            fi
+            if [ -n "$LAUNCH_URL" ]; then
+              echo "TESTOPS_LAUNCH_URL=${LAUNCH_URL}" >> "$GITHUB_ENV"
+            fi
+          fi
           set -e
 
       - name: Download Selenoid video
@@ -97,7 +119,9 @@ jobs:
           fi
 
       - name: Generate Allure 3 report
-        if: always()
+        if: always() && hashFiles('build/allure-results/**') != ''
+        id: allure-report
+        continue-on-error: true
         run: |
           mkdir -p build/allure-results
           cat > build/allure-results/executor.json <<EOF
@@ -111,7 +135,7 @@ jobs:
           ./gradlew allureReport
 
       - name: Prepare GitHub Pages
-        if: always()
+        if: always() && steps.allure-report.outcome == 'success' && hashFiles('build/reports/allure-report/allureReport/awesome/index.html') != ''
         run: |
           mkdir -p pages/reports/${REPORT_ID}
           cp -r build/reports/allure-report/allureReport/. "pages/reports/${REPORT_ID}/"
@@ -124,7 +148,7 @@ jobs:
           touch pages/.nojekyll
 
       - name: Deploy Allure report to GitHub Pages
-        if: always()
+        if: always() && hashFiles('pages/reports/**/awesome/index.html') != ''
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -147,7 +171,16 @@ jobs:
           echo "## UI Tests" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "- [GitHub Actions run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "- [Allure 3 report](${REPORT_URL})" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f build/reports/allure-report/allureReport/awesome/index.html ]; then
+            echo "- [Allure 3 report](${REPORT_URL})" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Allure 3 report: _не собран (нет результатов или ошибка генерации)_" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -n "${TESTOPS_LAUNCH_URL:-}" ]; then
+            echo "- [Allure TestOps launch](${TESTOPS_LAUNCH_URL})" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "${TESTOPS_UPLOAD_EXIT:-}" != "" ] && [ "${TESTOPS_UPLOAD_EXIT}" != "0" ]; then
+            echo "- Allure TestOps upload: _ошибка (см. шаг Upload results)_" >> "$GITHUB_STEP_SUMMARY"
+          fi
           if [ -n "${VIDEO_URL:-}" ]; then
             echo "- Selenoid video: \`${VIDEO_URL}\`" >> "$GITHUB_STEP_SUMMARY"
           fi
